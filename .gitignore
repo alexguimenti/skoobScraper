@@ -1,0 +1,6 @@
+.env
+.venv/
+books.json
+books.csv
+debug_*.html
+debug_*.json
