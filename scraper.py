@@ -7,7 +7,7 @@ import os
 import re
 import csv
 import json
-import time
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -16,15 +16,24 @@ from playwright.sync_api import sync_playwright
 load_dotenv()
 
 # Config
-USER_ID = "67bd128e70c4abc33794c484"
-FILTER = "all"
+USER_ID = os.getenv("SKOOB_USER_ID", "67bd128e70c4abc33794c484")
+FILTER = os.getenv("SKOOB_FILTER", "all")
 API_BASE = "https://prd-api.skoob.com.br/api/v1"
 SKOOB_BASE = "https://www.skoob.com.br"
 OUTPUT_FILE = "books.json"
 
 
-def get_session_cookies() -> dict:
-    """Login via Playwright and return session cookies."""
+def dismiss_cookies(page):
+    """Dismiss the cookie consent banner if present."""
+    try:
+        page.locator("#adopt-accept-all-button").click(timeout=2000)
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
+def get_session_cookies() -> tuple[dict, dict]:
+    """Login via Playwright and return session cookies + API auth headers."""
     email = os.getenv("SKOOB_EMAIL")
     password = os.getenv("SKOOB_PASSWORD")
 
@@ -44,38 +53,18 @@ def get_session_cookies() -> dict:
             print("✅ Já logado!")
         else:
             print("🔒 Fazendo login...")
+            dismiss_cookies(page)
 
-            # Dismiss cookie banner
-            try:
-                page.locator("#adopt-accept-all-button").click(timeout=3000)
-                page.wait_for_timeout(1000)
-            except Exception:
-                pass
-
-            # Click Entrar
             page.get_by_role("button", name="Entrar").locator("visible=true").first.click()
             page.wait_for_timeout(3000)
 
-            # Fill email
             page.fill('input[name="email"]', email)
             page.wait_for_timeout(500)
-
-            try:
-                page.locator("#adopt-accept-all-button").click(timeout=2000)
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
-
+            dismiss_cookies(page)
             page.get_by_role("button", name="Avançar").locator("visible=true").first.click()
             page.wait_for_timeout(3000)
 
-            # Fill password
-            try:
-                page.locator("#adopt-accept-all-button").click(timeout=2000)
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
-
+            dismiss_cookies(page)
             page.locator('input[name="password"]').first.fill(password)
             page.wait_for_timeout(500)
             page.get_by_role("button", name="Avançar").locator("visible=true").first.click()
@@ -84,7 +73,7 @@ def get_session_cookies() -> dict:
             page.wait_for_timeout(2000)
             print("✅ Logado!")
 
-        # Navigate to bookshelf to trigger the API call, and intercept its headers
+        # Intercept API auth headers from bookshelf request
         auth_headers = {}
 
         def capture_auth(request):
@@ -93,32 +82,26 @@ def get_session_cookies() -> dict:
 
         page.on("request", capture_auth)
 
-        bookshelf_url = f"{SKOOB_BASE}/pt/user/{USER_ID}/bookshelf"
         if "/bookshelf" not in page.url:
             page.goto(bookshelf_url, wait_until="domcontentloaded", timeout=60_000)
         else:
             page.reload(wait_until="domcontentloaded", timeout=60_000)
         page.wait_for_timeout(5000)
 
-        cookies = page.context.cookies()
+        cookies = {c["name"]: c["value"] for c in page.context.cookies()}
         browser.close()
 
-    cookie_dict = {c["name"]: c["value"] for c in cookies}
-    print(f"🍪 {len(cookie_dict)} cookies capturados")
-    print(f"🔑 {len(auth_headers)} headers da API capturados")
-    return cookie_dict, auth_headers
+    print(f"🍪 {len(cookies)} cookies | 🔑 {len(auth_headers)} headers capturados")
+    return cookies, auth_headers
 
 
 def fetch_bookshelf(cookies: dict, auth_headers: dict) -> list[dict]:
     """Fetch all books from the bookshelf API."""
     session = requests.Session()
     session.cookies.update(cookies)
-    # Use the exact headers the browser sent to the API
     session.headers.update(auth_headers)
-    # Override host for direct API calls
     session.headers["host"] = "prd-api.skoob.com.br"
 
-    # First page to get total
     params = {
         "page": 1,
         "limit": 30,
@@ -136,16 +119,16 @@ def fetch_bookshelf(cookies: dict, auth_headers: dict) -> list[dict]:
     total_items = data["total_items"]
     print(f"📚 {total_items} livros em {total_pages} páginas")
 
-    all_books = data["items"]
+    all_books = list(data["items"])
     print(f"📖 Página 1/{total_pages} — {len(data['items'])} livros")
 
     for page_num in range(2, total_pages + 1):
         params["page"] = page_num
         resp = session.get(f"{API_BASE}/bookshelf", params=params)
         resp.raise_for_status()
-        data = resp.json()
-        all_books.extend(data["items"])
-        print(f"📖 Página {page_num}/{total_pages} — {len(data['items'])} livros")
+        page_data = resp.json()
+        all_books.extend(page_data["items"])
+        print(f"📖 Página {page_num}/{total_pages} — {len(page_data['items'])} livros")
 
     return all_books
 
@@ -161,7 +144,6 @@ def fetch_book_ratings(session: requests.Session, slug: str) -> dict:
 
         avg_match = re.search(r'"ratingValue"\s*:\s*([\d.]+)', html)
         count_match = re.search(r'"ratingCount"\s*:\s*(\d+)', html)
-        # readers is in RSC escaped JSON: \"readers\":123
         readers_match = re.search(r'\\?"readers\\?"\s*:\s*(\d+)', html)
 
         result = {}
@@ -187,17 +169,18 @@ def enrich_with_ratings(cookies: dict, books: list[dict]) -> list[dict]:
     total = len(books)
     print(f"\n⭐ Buscando notas e avaliações de {total} livros...")
 
-    done = 0
+    counter = {"done": 0}
+    lock = threading.Lock()
 
     def fetch_one(book):
-        nonlocal done
         slug = book.get("slug", "")
         if not slug:
             return book, {}
         ratings = fetch_book_ratings(session, slug)
-        done += 1
-        if done % 20 == 0 or done == total:
-            print(f"   {done}/{total} livros processados")
+        with lock:
+            counter["done"] += 1
+            if counter["done"] % 20 == 0 or counter["done"] == total:
+                print(f"   {counter['done']}/{total} livros processados")
         return book, ratings
 
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -209,17 +192,10 @@ def enrich_with_ratings(cookies: dict, books: list[dict]) -> list[dict]:
     return books
 
 
-def main():
-    cookies, auth_headers = get_session_cookies()
-    books = fetch_bookshelf(cookies, auth_headers)
-
-    # Enrich with ratings from book detail pages
-    books = enrich_with_ratings(cookies, books)
-
-    # Build clean output
-    output = []
-    for book in books:
-        output.append({
+def build_output(books: list[dict]) -> list[dict]:
+    """Transform raw API data into clean output format."""
+    return [
+        {
             "book_id": book.get("book_id"),
             "edition_id": book.get("edition_id"),
             "title": book.get("title"),
@@ -236,12 +212,16 @@ def main():
             "finished_at": book.get("finished_at"),
             "url": f"{SKOOB_BASE}/book/{book.get('edition_id')}",
             "cover": book.get("cover_filename"),
-        })
+        }
+        for book in books
+    ]
 
+
+def save(output: list[dict]):
+    """Save output to JSON and CSV."""
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    # CSV export
     csv_file = OUTPUT_FILE.replace(".json", ".csv")
     with open(csv_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=output[0].keys())
@@ -249,6 +229,14 @@ def main():
         writer.writerows(output)
 
     print(f"\n✅ {len(output)} livros salvos em {OUTPUT_FILE} e {csv_file}")
+
+
+def main():
+    cookies, auth_headers = get_session_cookies()
+    books = fetch_bookshelf(cookies, auth_headers)
+    books = enrich_with_ratings(cookies, books)
+    output = build_output(books)
+    save(output)
 
 
 if __name__ == "__main__":

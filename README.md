@@ -30,17 +30,23 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1          # PowerShell
 # ou: source .venv/Scripts/activate  # Git Bash
 
-pip install playwright python-dotenv requests
+pip install -r requirements.txt
 playwright install chromium
 ```
 
 ## Configuração
 
-Crie um arquivo `.env` na raiz do projeto:
+```bash
+cp .env.example .env
+```
+
+Edite o `.env` com suas credenciais:
 
 ```
 SKOOB_EMAIL=seu@email.com
 SKOOB_PASSWORD=suasenha
+SKOOB_USER_ID=seu_user_id       # opcional, tem default
+SKOOB_FILTER=all                # opcional: all, read, reading, want_to_read, abandoned
 ```
 
 ## Uso
@@ -64,6 +70,6 @@ O scraper:
 
 ## Personalização
 
-No `scraper.py`, altere:
-- `USER_ID` — seu ID de usuário do Skoob
-- `FILTER` — filtro da estante (`all`, `read`, `reading`, `want_to_read`, `abandoned`, etc.)
+Via variáveis de ambiente no `.env`:
+- `SKOOB_USER_ID` — seu ID de usuário (visível na URL do perfil)
+- `SKOOB_FILTER` — filtro da estante (`all`, `read`, `reading`, `want_to_read`, `abandoned`, `desired`, `favorited`, `owned`, `lent`, `ebook`, `audiobook`)
